@@ -107,7 +107,8 @@ def loss_nps(img, color_set):
 
 
 def attack(args):
-    model_name = "my_mono+stereo_1024x320"  # weights fine-tuned on Carla dataset
+    model_name = "mono+stereo_1024x320"
+    # model_name = "my_mono+stereo_1024x320"  # weights fine-tuned on Carla dataset
     download_model_if_doesnt_exist(model_name)
     encoder_path = os.path.join("models", model_name, "encoder.pth")
     depth_decoder_path = os.path.join("models", model_name, "depth.pth")
@@ -124,6 +125,7 @@ def attack(args):
     depth_decoder.load_state_dict(loaded_dict)
 
     depth_model = DepthModelWrapper(encoder, depth_decoder).to(args.device)
+    depth_model = torch.nn.DataParallel(depth_model)
 
     depth_model.eval()
     for para in depth_model.parameters():
@@ -150,6 +152,8 @@ def attack(args):
     # continuous color
     camou_para = torch.rand([1, h, w, 3]).float().to(args.device)
     camou_para.requires_grad_(True)
+    from copy import deepcopy
+    begin_para = deepcopy(camou_para)
     optimizer = optim.Adam([camou_para], lr=args.lr)
     camou_para1 = expand_kernel(camou_para.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
 
@@ -163,11 +167,14 @@ def attack(args):
     # print(textures) # wjk tested
     dataset.set_textures(camou_para1)
 
-    for epoch in range(15):
+    for epoch in range(args.epochs):
         print('-'*30 + 'epoch begin: ' + str(epoch) + '-'*30)
         tqdm_loader = tqdm(loader)
-        for i, (index, total_img, total_img0, mask, img) in enumerate(tqdm_loader):
-            
+        # 
+        for i, (index, total_img, total_img0, mask, img, pred1, pred0) in enumerate(tqdm_loader):
+            # print(data)
+            # raise ValueError(len(data))
+
             input_image = input_resize(total_img)
             input_image0 = input_resize(total_img0)
             outputs = depth_model(input_image)
@@ -194,8 +201,13 @@ def attack(args):
             camou_para1 = torch.clamp(camou_para1, 0, 1)
             dataset.set_textures(camou_para1)
         camou_png = cv2.cvtColor((camou_para1[0].detach().cpu().numpy()*255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(args.log_dir+str(epoch)+'camou.png', camou_png)
-        np.save(args.log_dir+str(epoch)+'camou.npy', camou_para.detach().cpu().numpy())
+        try:
+            cv2.imwrite(args.log_dir+str(epoch)+'camou.png', camou_png)
+            np.save(args.log_dir+str(epoch)+'camou.npy', camou_para.detach().cpu().numpy())
+        except:
+            print(f"failed to print or save {args.log_dir} {epoch}")
+    
+    return depth_model, begin_para, camou_para, camou_png
 
 
 if __name__ == '__main__':
@@ -203,12 +215,14 @@ if __name__ == '__main__':
     parser.add_argument("--camou_mask", type=str, default='./car/mask.jpg', help="camouflage texture mask")
     parser.add_argument("--camou_shape", type=int, default=1024, help="shape of camouflage texture")
     parser.add_argument("--obj_name", type=str, default='./car/lexus_hs.obj')
-    parser.add_argument("--device", type=torch.device, default=torch.device("cuda:0"))
+    parser.add_argument("--device", type=str, default='cuda:0')
     parser.add_argument("--train_dir", type=str, default='/data/zjh/mde_carla/')
     parser.add_argument("--img_size", type=tuple, default=(320, 1024))
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=int, default=0.01)
     parser.add_argument("--log_dir", type=str, default='./res/')
     args = parser.parse_args()
+
+    args.device = torch.device(args.device)
     attack(args)
     
