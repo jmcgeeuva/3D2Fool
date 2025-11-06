@@ -1,0 +1,15 @@
+# https://github.com/Gandolfczjh/3D2Fool/issues/17
+conda create -n cars python=3.8.17 nvidiacub fvcore iopath  pytorch=1.13.0 torchvision pytorch-cuda=11.6 jupyter -c pytorch -c nvidia -c bottler -c fvcore -c iopath -c conda-forge
+source activate cars
+python -c "import torch; print(torch.version.cuda); print(torch.cuda.is_available())"
+nvcc --version
+# https://github.com/facebookresearch/pytorch3d/blob/v0.7.4/INSTALL.md
+git clone https://github.com/facebookresearch/pytorch3d.git
+cd pytorch3d
+conda install cudatoolkit-dev -c conda-forge
+python setup.py install
+python -c "import pytorch3d"
+cd ..
+python -m pip install opencv-python matplotlib tqdm
+git clone 
+python attack_base.py --train_dir ./ --device 'cuda'

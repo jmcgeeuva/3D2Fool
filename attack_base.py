@@ -12,6 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torch.nn.functional as F
 import torch.optim as optim
+from copy import deepcopy
 
 from pytorch3d.io import load_objs_as_meshes, load_obj
 from pytorch3d.renderer import (
@@ -105,86 +106,126 @@ def loss_nps(img, color_set):
     gap = torch.min(torch.sum(torch.abs(img1 - color_set1)/255, -1), 1).values
     return torch.sum(gap)/h/w
 
-
-def attack(args):
-    model_name = "my_mono+stereo_1024x320"  # weights fine-tuned on Carla dataset
+def load_depth_model(model_name, device):
+    # model_name = "my_mono+stereo_1024x320"  # weights fine-tuned on Carla dataset
     download_model_if_doesnt_exist(model_name)
     encoder_path = os.path.join("models", model_name, "encoder.pth")
     depth_decoder_path = os.path.join("models", model_name, "depth.pth")
 
-    # LOADING PRETRAINED MODEL
+    # CREATING PRETRAINED MODEL
     encoder = networks.ResnetEncoder(18, False)
     depth_decoder = networks.DepthDecoder(num_ch_enc=encoder.num_ch_enc, scales=range(4))
 
+    # Load encoder
     loaded_dict_enc = torch.load(encoder_path, map_location='cpu')
     filtered_dict_enc = {k: v for k, v in loaded_dict_enc.items() if k in encoder.state_dict()}
     encoder.load_state_dict(filtered_dict_enc)
 
+    # Load decoder
     loaded_dict = torch.load(depth_decoder_path, map_location='cpu')
     depth_decoder.load_state_dict(loaded_dict)
 
-    depth_model = DepthModelWrapper(encoder, depth_decoder).to(args.device)
+    # Set up depth model wrapper
+    depth_model = DepthModelWrapper(encoder, depth_decoder).to(device)
+    depth_model = torch.nn.DataParallel(depth_model)
 
+    # Freeze the model
     depth_model.eval()
     for para in depth_model.parameters():
         para.requires_grad_(False)
+    return depth_model, loaded_dict_enc['height'], loaded_dict_enc['width']
 
-    feed_height = loaded_dict_enc['height']
-    feed_width = loaded_dict_enc['width']
+def attack(args):
+    model_name = "mono+stereo_1024x320"
+    train_attack(device=args.device,
+                 model_name=model_name, 
+                 H=args.camou_shape,
+                 W=args.camou_shape,
+                 lr=args.lr, 
+                 train_dir=args.train_dir, 
+                 img_size=args.img_size, 
+                 batch_size=args.batch_size, 
+                 epochs=args.epochs, 
+                 obj_name=args.obj_name, 
+                 camou_mask=args.camou_mask, 
+                 log_dir=args.log_dir)
+
+def train_attack(device, 
+                 train_dir: str = './', 
+                 img_size: tuple = (320, 1024), 
+                 batch_size: int = 16, 
+                 epochs: int = 15,
+                 obj_name: str = './car/lexus_hs.obj', 
+                 H: int = 1024, 
+                 W: int = 1024, 
+                 log_dir: str = './res/',
+                 model_name: str = 'mono+stereo_1024x320', 
+                 camou_mask: str = './car/mask.jpg',  
+                 lr: float = 0.01,
+                 resolution: int = 8):
+
+    depth_model, feed_height, feed_width = load_depth_model(model_name, device)
+
     input_resize = transforms.Resize([feed_height, feed_width])
-    # keys = [("disp", 0), ("disp", 1), ("disp", 2), ("disp", 3)]
-    # disp_size = [[192, 640], [96, 320], [48, 160], [24, 80]]
-    
-    H, W = args.camou_shape, args.camou_shape
-    resolution = 8
     h, w = int(H/resolution), int(W/resolution)
 
-    expand_kernel = torch.nn.ConvTranspose2d(3, 3, resolution, stride=resolution, padding=0).to(args.device)
+    ##################################### SETUP Transpose #############################################
+    expand_kernel = torch.nn.ConvTranspose2d(3, 3, resolution, stride=resolution, padding=0).to(device)
     expand_kernel.weight.data.fill_(0)
     expand_kernel.bias.data.fill_(0)
     for i in range(3):
         expand_kernel.weight[i, i, :, :].data.fill_(1)
+    ###################################################################################################
 
-    color_set = torch.tensor([[0,0,0],[255,255,255],[0,18,79],[5,80,214],[71,178,243],[178,159,211],[77,58,0],[211,191,167],[247,110,26],[110,76,16]]).to(args.device).float() / 255
+    # White, Black, Navy Blue, Royal Blue, Sky Blue, Lavender, Dark Olive, Tan, Orange, Brown
+    color_set = torch.tensor([[0,0,0],[255,255,255],[0,18,79],[5,80,214],[71,178,243],[178,159,211],[77,58,0],[211,191,167],[247,110,26],[110,76,16]]).to(device).float() / 255
 
     # continuous color
-    camou_para = torch.rand([1, h, w, 3]).float().to(args.device)
+    camou_para = torch.rand([1, h, w, 3]).float().to(device)
     camou_para.requires_grad_(True)
-    optimizer = optim.Adam([camou_para], lr=args.lr)
+    begin_para = deepcopy(camou_para)
+    optimizer = optim.Adam([camou_para], lr=lr)
     camou_para1 = expand_kernel(camou_para.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
 
-    dataset = MyDataset(args.train_dir, args.img_size, args.obj_name, args.camou_mask, args.device)
+    ###################################### LOAD DATASET ################################################
+    dataset = MyDataset(train_dir, img_size, obj_name, camou_mask, device)
     loader = DataLoader(
         dataset=dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=False,
         # num_workers=2,
     )
     # print(textures) # wjk tested
+    ####################################################################################################
     dataset.set_textures(camou_para1)
 
-    for epoch in range(15):
+    for epoch in range(epochs):
         print('-'*30 + 'epoch begin: ' + str(epoch) + '-'*30)
         tqdm_loader = tqdm(loader)
-        for i, (index, total_img, total_img0, mask, img) in enumerate(tqdm_loader):
-            
+        running_loss = 0
+        # 
+        for i, (index, total_img, total_img0, mask, img, pred1, pred0) in enumerate(tqdm_loader):
+            # print(data)
+            # raise ValueError(len(data))
+
             input_image = input_resize(total_img)
             input_image0 = input_resize(total_img0)
             outputs = depth_model(input_image)
             # if i%3==0:
             #     total_img_np = total_img.data.cpu().numpy()[0] * 255
             #     total_img_np = Image.fromarray(np.transpose(total_img_np, (1,2,0)).astype('uint8'))
-            #     total_img_np.save(os.path.join(args.log_dir, 'test_total.jpg'))
+            #     total_img_np.save(os.path.join(log_dir, 'test_total.jpg'))
             #     total_img_np0 = total_img0.data.cpu().numpy()[0] * 255
             #     total_img_np0 = Image.fromarray(np.transpose(total_img_np0, (1,2,0)).astype('uint8'))
-            #     total_img_np0.save(os.path.join(args.log_dir, 'test_total0.jpg'))
+            #     total_img_np0.save(os.path.join(log_dir, 'test_total0.jpg'))
 
-            outputs0 = depth_model(input_image0)
+            # outputs0 = depth_model(input_image0)
             mask = input_resize(mask)[:, 0, :, :]
             adv_loss = torch.sum(10 * torch.pow(outputs*mask,2))/torch.sum(mask)
             tv_loss = loss_smooth(camou_para) * 1e-1
             nps_loss = loss_nps(camou_para, color_set) * 5
             loss = tv_loss + adv_loss + nps_loss
+            running_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward(retain_graph=True)
@@ -194,8 +235,14 @@ def attack(args):
             camou_para1 = torch.clamp(camou_para1, 0, 1)
             dataset.set_textures(camou_para1)
         camou_png = cv2.cvtColor((camou_para1[0].detach().cpu().numpy()*255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-        cv2.imwrite(args.log_dir+str(epoch)+'camou.png', camou_png)
-        np.save(args.log_dir+str(epoch)+'camou.npy', camou_para.detach().cpu().numpy())
+        try:
+            print(f'Current loss: {running_loss/len(loader)}')
+            cv2.imwrite(log_dir+str(epoch)+'camou.png', camou_png)
+            np.save(log_dir+str(epoch)+'camou.npy', camou_para.detach().cpu().numpy())
+        except:
+            print(f"failed to print or save {log_dir} {epoch}")
+    
+    return depth_model, expand_kernel, optimizer, begin_para, camou_para, camou_png
 
 
 if __name__ == '__main__':
@@ -203,12 +250,14 @@ if __name__ == '__main__':
     parser.add_argument("--camou_mask", type=str, default='./car/mask.jpg', help="camouflage texture mask")
     parser.add_argument("--camou_shape", type=int, default=1024, help="shape of camouflage texture")
     parser.add_argument("--obj_name", type=str, default='./car/lexus_hs.obj')
-    parser.add_argument("--device", type=torch.device, default=torch.device("cuda:0"))
+    parser.add_argument("--device", type=str, default='cuda:0')
     parser.add_argument("--train_dir", type=str, default='/data/zjh/mde_carla/')
     parser.add_argument("--img_size", type=tuple, default=(320, 1024))
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=int, default=0.01)
     parser.add_argument("--log_dir", type=str, default='./res/')
     args = parser.parse_args()
+
+    args.device = torch.device(args.device)
     attack(args)
     
